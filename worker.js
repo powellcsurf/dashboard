@@ -79,22 +79,163 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read accounting.settings.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth (client_secret_basic)
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* ---- Xero-specific helpers ---- */
+
+    async _tenantId(env, h) {
+      const cached = await env.TOKENS.get('xero:tenantId');
+      if (cached) return cached;
+      const conns = await h.fetchJson('https://api.xero.com/connections', {}, {});
+      const tenant = Array.isArray(conns) && conns[0];
+      if (!tenant) { const e = new Error('no Xero tenant connected'); e.status = 401; throw e; }
+      await env.TOKENS.put('xero:tenantId', tenant.tenantId);
+      await env.TOKENS.put('xero:tenantName', tenant.tenantName || '');
+      return tenant.tenantId;
+    },
+
+    /* Walk the Xero P&L report JSON into { revenue, cogs, wagesSuper, overheads }
+       for ONE period (single-amount-column report). See capability-matrix.md
+       for the exact row shape and the worked example this mirrors. */
+    _walkReport(reportRows) {
+      const WAGE_RE = /wages|salaries|superannuation|super|payroll|annual leave|long service|workcover/i;
+      let revenue = 0, cogs = 0, opex = 0, wagesSuper = 0;
+      const wageLines = [];
+
+      function amountOf(cells) {
+        // last cell is the (single) period amount for a single-period report
+        const v = cells && cells.length ? cells[cells.length - 1].Value : '0';
+        const n = parseFloat(String(v).replace(/,/g, ''));
+        return isNaN(n) ? 0 : n;
+      }
+
+      function walkSection(section) {
+        const title = (section.Title || '').toLowerCase();
+        const isIncome = title === 'income' || title === 'revenue' || title === 'trading income';
+        const isOtherIncome = title.indexOf('other income') !== -1;
+        const isCOS = title.indexOf('cost of sales') !== -1 || title.indexOf('cost of goods') !== -1;
+        const isOpex = title.indexOf('operating expenses') !== -1 || title.indexOf('expenses') !== -1;
+
+        for (const row of section.Rows || []) {
+          if (row.RowType === 'Row') {
+            const label = (row.Cells && row.Cells[0] && row.Cells[0].Value) || '';
+            const amt = amountOf(row.Cells);
+            if (isIncome && !isOtherIncome) revenue += amt;
+            else if (isCOS) cogs += amt;
+            else if (isOpex) {
+              opex += amt;
+              if (WAGE_RE.test(label)) { wagesSuper += amt; wageLines.push(label); }
+            }
+          } else if (row.RowType === 'Section') {
+            walkSection(row);
+          }
+        }
+      }
+
+      for (const row of reportRows || []) {
+        if (row.RowType === 'Section') walkSection(row);
+      }
+
+      return {
+        revenue,
+        cogs,
+        wagesSuper,
+        overheads: opex - wagesSuper,
+        _wageLines: wageLines   // surfaced for the reconciliation "is that all of them?" check
+      };
+    },
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      try {
+        const tenantId = await this._tenantId(env, h);
+        const tenantName = (await env.TOKENS.get('xero:tenantName')) || '';
+        return {
+          connected: true,
+          org: tenantName,
+          sandbox: /demo company/i.test(tenantName),
+          lastSync: await lastSync(env, 'accounting')
+        };
+      } catch (e) {
+        return { connected: false };
+      }
+    },
+
+    async fetchRange(env, h, q) {
+      const tenantId = await this._tenantId(env, h);
+      const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss'
+        + '?fromDate=' + encodeURIComponent(q.from)
+        + '&toDate=' + encodeURIComponent(q.to)
+        + '&standardLayout=true';
+      const data = await h.fetchJson(url, {
+        headers: { 'Xero-Tenant-Id': tenantId, Accept: 'application/json' }
+      }, {});
+      const report = data && data.Reports && data.Reports[0];
+      const result = this._walkReport(report ? report.Rows : []);
+      await h.noteSync();
+      return { revenue: result.revenue, cogs: result.cogs, wagesSuper: result.wagesSuper, overheads: result.overheads };
+    },
+
+    /* Multi-period report, capped at 12 periods per call - stitch two calls
+       for anything longer (see capability-matrix.md). q.months = ['YYYY-MM',...] */
+    async fetchMonthly(env, h, q) {
+      const tenantId = await this._tenantId(env, h);
+      const months = q.months || [];
+      const out = { months: [], revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (let i = 0; i < months.length; i += 12) {
+        const chunk = months.slice(i, i + 12);
+        const toDate = chunk[chunk.length - 1] + '-28'; // end-of-month-ish anchor; Xero resolves periods from this date backward
+        const url = 'https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss'
+          + '?date=' + encodeURIComponent(toDate)
+          + '&periods=' + chunk.length
+          + '&timeframe=MONTH'
+          + '&standardLayout=true';
+        const data = await h.fetchJson(url, {
+          headers: { 'Xero-Tenant-Id': tenantId, Accept: 'application/json' }
+        }, {});
+        const report = data && data.Reports && data.Reports[0];
+        const rows = report ? report.Rows : [];
+        // Multi-period rows carry one amount cell per period (oldest first, per Xero's layout);
+        // walk each column separately by slicing Cells per index.
+        for (let p = 0; p < chunk.length; p++) {
+          const perPeriodRows = rows.map(sliceColumn(p));
+          const result = this._walkReport(perPeriodRows);
+          out.months.push(chunk[p]);
+          out.revenue.push(result.revenue);
+          out.cogs.push(result.cogs);
+          out.wagesSuper.push(result.wagesSuper);
+          out.overheads.push(result.overheads);
+        }
+      }
+      await h.noteSync();
+      return out;
+
+      // slice a single period's amount column out of a multi-period section tree
+      function sliceColumn(periodIndex) {
+        return function walk(node) {
+          if (!node) return node;
+          if (node.RowType === 'Row' || node.RowType === 'SummaryRow') {
+            const label = node.Cells && node.Cells[0];
+            const amt = node.Cells && node.Cells[periodIndex + 1];
+            return { ...node, Cells: [label, amt || { Value: '0' }] };
+          }
+          if (node.RowType === 'Section') {
+            return { ...node, Rows: (node.Rows || []).map(walk) };
+          }
+          return node;
+        };
+      }
+    }
   },
 
   /* >>> ADAPTER 2: POS
